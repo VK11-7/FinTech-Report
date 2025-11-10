@@ -1,12 +1,11 @@
-import os, json, io, fitz, matplotlib.pyplot as plt
-import streamlit as st
+import os, io, json, fitz, matplotlib.pyplot as plt, streamlit as st
 from typing import List, Dict, Any
 from scipy.special import softmax
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForSeq2SeqLM
 from fpdf import FPDF
 
-# LangChain imports
+# LangChain
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,7 +15,7 @@ from langchain_core.documents import Document
 FINBERT_MODEL = "ProsusAI/finbert"
 INSTRUCTION_MODEL = "google/flan-t5-large"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-CHROMA_DIR = "./chroma_fin"
+CHROMA_DIR = "./chroma_dynamic_fin"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ---------------- LOAD MODELS ----------------
@@ -46,14 +45,16 @@ def finbert_sentiment(text: str) -> Dict[str, float]:
     labels = ["positive", "negative", "neutral"]
     return {labels[i]: float(probs[i]) for i in range(len(labels))}
 
-def build_vectorstore(docs: List[str], embedding_fn):
-    if os.path.exists(CHROMA_DIR) and os.listdir(CHROMA_DIR):
-        return Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding_fn)
+def init_vectorstore(embedding_fn) -> Chroma:
+    if not os.path.exists(CHROMA_DIR):
+        os.makedirs(CHROMA_DIR)
+    return Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding_fn)
+
+def add_document(store: Chroma, text: str, metadata: dict = None):
     splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
-    chunks = []
-    for d in docs:
-        chunks.extend(splitter.split_documents([Document(page_content=d)]))
-    return Chroma.from_documents(chunks, embedding=embedding_fn, persist_directory=CHROMA_DIR)
+    chunks = splitter.split_documents([Document(page_content=text, metadata=metadata or {})])
+    store.add_documents(chunks)
+    store.persist()
 
 def retrieve_context(store: Chroma, query: str, k=3) -> str:
     retriever = store.as_retriever(search_kwargs={"k": k})
@@ -63,12 +64,12 @@ def retrieve_context(store: Chroma, query: str, k=3) -> str:
 def generate_structured_summary(text: str, context: str, sentiment: Dict[str, float]) -> Dict[str, Any]:
     text, context = text[:1500], context[:1000]
     prompt = f"""
-Summarize the following REPORT into structured JSON.
+Summarize the REPORT into JSON.
 
 Schema:
 {{
   "summary": "One-sentence summary.",
-  "drivers": ["2-3 key business drivers"],
+  "drivers": ["2-3 key drivers"],
   "risks": ["2-3 key risks"],
   "recommendation": "Buy / Hold / Sell",
   "confidence": 0.0-1.0
@@ -96,7 +97,7 @@ Return only JSON.
 
 def generate_abstractive_summary(text: str, context: str, sentiment: Dict[str, float]) -> str:
     prompt = f"""
-Write a fluent 2–3 sentence summary using CONTEXT and FINBERT sentiment.
+Write a fluent 2–3 sentence summary using CONTEXT and SENTIMENT.
 
 CONTEXT:
 {context}
@@ -130,75 +131,57 @@ def plot_sentiment_trend(trend: Dict[str, List[float]]):
     ax.legend(); ax.grid(alpha=0.3)
     return fig
 
-def export_to_pdf(summary_json: dict, abstract_summary: str, sentiment: dict, fig) -> bytes:
-    """Export all analysis results to a single downloadable PDF."""
-    pdf = FPDF()
-    pdf.add_page()
+def export_pdf(summary_json, abstract_summary, sentiment, fig):
+    pdf = FPDF(); pdf.add_page()
     pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "AI Financial Report Analysis", ln=True, align="C")
+    pdf.cell(0, 10, "AI Financial Report Summary", ln=True, align="C")
     pdf.set_font("Arial", "", 12)
-    pdf.multi_cell(0, 10, f"\nOverall Sentiment:\n{json.dumps(sentiment, indent=2)}")
+    pdf.multi_cell(0, 10, f"\nSentiment:\n{json.dumps(sentiment, indent=2)}")
     pdf.multi_cell(0, 10, f"\nStructured Summary:\n{json.dumps(summary_json, indent=2)}")
     pdf.multi_cell(0, 10, f"\nAbstractive Summary:\n{abstract_summary}")
-
-    # Save trend plot to buffer
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png"); buf.seek(0)
-    img_path = "trend_temp.png"
-    with open(img_path, "wb") as f:
-        f.write(buf.read())
+    buf = io.BytesIO(); fig.savefig(buf, format="png"); buf.seek(0)
+    img_path = "temp_trend.png"
+    with open(img_path, "wb") as f: f.write(buf.read())
     pdf.image(img_path, x=10, w=180)
     os.remove(img_path)
+    return pdf.output(dest="S").encode("latin-1")
 
-    pdf_bytes = pdf.output(dest="S").encode("latin-1")
-    return pdf_bytes
+# ---------------- STREAMLIT APP ----------------
+st.set_page_config(page_title="Dynamic Financial AI", layout="wide")
+st.title("💼 Dynamic Generative AI Financial Report Summarization")
 
-# ---------------- STREAMLIT UI ----------------
-st.set_page_config(page_title="AI Financial Report Analyzer", layout="wide")
-st.title("💼 Generative AI for Financial Report Summarization with PDF Export")
-
-uploaded_file = st.sidebar.file_uploader("📂 Upload Financial Report (.pdf or .txt)", type=["pdf", "txt"])
-historical_docs = [
-    "Q1 2025: Stable revenue but margins declined due to raw-material inflation.",
-    "Q2 2025: Strong demand recovery and improved cost control.",
-    "Q3 2025: Operating margin up 10% from higher production efficiency."
-]
-store = build_vectorstore(historical_docs, embedding_fn)
+uploaded_file = st.sidebar.file_uploader("📂 Upload Report (.pdf/.txt)", type=["pdf", "txt"])
+store = init_vectorstore(embedding_fn)
 
 if uploaded_file:
     report_text = extract_text(uploaded_file)
-    st.subheader("1️⃣ Report Preview")
-    st.text_area("Extracted Report", report_text[:2000] + "...", height=200)
+    company_name = uploaded_file.name.split(".")[0]
+    st.subheader(f"📊 Analyzing: {company_name}")
+    st.text_area("Extracted Text", report_text[:2000] + "...", height=200)
 
-    st.subheader("2️⃣ FinBERT Sentiment")
+    # Add to RAG memory
+    add_document(store, report_text, {"filename": company_name})
+    st.success(f"✅ Added {company_name} to RAG memory!")
+
     sentiment = finbert_sentiment(report_text)
-    st.json(sentiment)
+    st.subheader("FinBERT Sentiment"); st.json(sentiment)
 
-    st.subheader("3️⃣ RAG Context")
     context = retrieve_context(store, report_text)
-    st.text_area("Retrieved Context", context, height=150)
+    st.subheader("RAG Context"); st.text_area("Relevant Context", context, height=200)
 
-    st.subheader("4️⃣ Structured JSON Summary")
     summary_json = generate_structured_summary(report_text, context, sentiment)
-    st.json(summary_json)
+    st.subheader("Structured Summary"); st.json(summary_json)
 
-    st.subheader("5️⃣ Abstractive Narrative Summary")
     abstract_summary = generate_abstractive_summary(report_text, context, sentiment)
-    st.write(abstract_summary)
+    st.subheader("Abstractive Summary"); st.write(abstract_summary)
 
-    st.subheader("6️⃣ Sentiment Trend Analysis")
-    all_texts = historical_docs + [report_text]
-    trend = compute_sentiment_trend(all_texts)
-    fig = plot_sentiment_trend(trend)
-    st.pyplot(fig)
+    all_docs = store.get(include=["documents"])["documents"]
+    trend = compute_sentiment_trend(all_docs)
+    st.subheader("Sentiment Trend")
+    fig = plot_sentiment_trend(trend); st.pyplot(fig)
 
-    pdf_data = export_to_pdf(summary_json, abstract_summary, sentiment, fig)
-    st.download_button(
-        label="📥 Download Full Report (PDF)",
-        data=pdf_data,
-        file_name="Financial_AI_Report.pdf",
-        mime="application/pdf"
-    )
-    st.success("✅ Analysis complete!")
+    pdf_bytes = export_pdf(summary_json, abstract_summary, sentiment, fig)
+    st.download_button("📥 Download PDF Report", data=pdf_bytes,
+                       file_name=f"{company_name}_AI_Report.pdf", mime="application/pdf")
 else:
-    st.info("👆 Upload a financial report to start analysis.")
+    st.info("👆 Upload a financial report to begin dynamic analysis.")
