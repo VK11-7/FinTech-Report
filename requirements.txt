@@ -1,0 +1,25 @@
+# Core ML & AI Libraries
+torch
+transformers
+sentence-transformers
+scipy
+numpy
+
+# LangChain Ecosystem
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+chromadb
+
+# Visualization & Dashboard
+matplotlib
+streamlit
+
+# File Handling & PDF Processing
+pymupdf
+fpdf
+
+# Utility & Environment
+tqdm
+pandas
